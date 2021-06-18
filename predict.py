@@ -12,97 +12,92 @@ import sys
 import argparse
 import json
 import train
-from train import load_pretrained_network
+from train import load_checkpoint
+from train import define_transforms
 
-
+#load a file that maps category label to category name
 def load_categories_to_name():
     with open('cat_to_name.json', 'r') as f:
         return json.load(f)
-    
-def save_checkpoint():
-    model.class_to_idx = image_datasets['train'].class_to_idx
-    checkpoint = {'input_size': 2208,
-                  'output_size': 102,
-                  'classifier': classifier,
-                  'optimizer': optimizer,
-                  'epochs': epochs,
-                  'state_dict': model.state_dict(),
-                  'class_to_idx': model.class_to_idx,}
-    torch.save(checkpoint, 'checkpoint.pth')
-    
-def load_checkpoint(model, filepath):
-    checkpoint = torch.load(filepath)
-    # Freeze parameters
-    for param in model.parameters():
-        param.requires_grad = False
-        model.classifier = checkpoint['classifier']
-        optimizer = checkpoint['optimizer']
-        epochs = checkpoint['epochs']
-        model.load_state_dict(checkpoint['state_dict'])
-        model.class_to_idx = checkpoint['class_to_idx']
-    return model
+ 
 
+#Process a PIL image for use in a PyTorch model
 def process_image(image_path):
     ''' Scales, crops, and normalizes a PIL image for a PyTorch model,
         returns an Numpy array
     '''
-    # TODO: Process a PIL image for use in a PyTorch model
+    #read image from file
     image = Image.open(image_path) 
     width, height = image.size 
     small_size_to = 256
+    
+    #resize image shorter size to 256 pixels, keeping the aspect ratio
     if width > height: 
         image.resize((width, small_size_to))
     else: 
         image.resize((small_size_to,height))
-            
+
+    #crop out the center 224x224 portion of the image
     width, height = image.size 
     reduce_size = 224
     left = (width - reduce_size)/2 
     right = left + reduce_size
     top = (height - reduce_size)/2
-    bottom = top + reduce_size
+    bottom = top + reduce_size   
     image = image.crop ((left, top, right, bottom))
     
     mean = np.array ([0.485, 0.456, 0.406]) 
     std = np.array ([0.229, 0.224, 0.225])
+    
+    #convert color channels of images as integers 0-255 to floats 0-1 which the model expected
+    #first convert image to numpy array then scale it down to values from 0-1.
+    #then get the mean color by substrating mean array and divided by standard deviation array
     np_image = np.array(image)/255
     np_image -= mean
     np_image /= std
     
+    #pytorch expects color channel to be first dimension, but it's the third dimension in the PIL image and Numpy array
+    #hence reorder dimensions using ndarray.transpose
     np_image= np_image.transpose ((2,0,1))
     return np_image
 
-def imshow(image, ax=None, title=None):
-    """Imshow for Tensor."""
-    if ax is None:
-        fig, ax = plt.subplots()
-    
-    # PyTorch tensors assume the color channel is the first dimension
-    # but matplotlib assumes is the third dimension
-    image = image.numpy().transpose((1, 2, 0))
-    
-    # Undo preprocessing
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    image = std * image + mean
-    
-    # Image needs to be clipped between 0 and 1 or it looks like noise when displayed
-    image = np.clip(image, 0, 1)
-    
-    ax.imshow(image)
-    
-    return ax
+# Define a new, untrainted feed-forward network as a classifier, using ReLU activations and dropout
+def feed_forward(model, arch, hidden_unit=1024):
+    if arch == 'vgg16':
+        in_feature = list(model.children())[1][0].in_features
+        model.classifier = nn.Sequential(OrderedDict([                         
+                          ('fc1', nn.Linear(int(in_feature), hidden_unit, bias=True)),
+                          ('relu1', nn.ReLU()),
+                          ('dropout1', nn.Dropout(p=0.5)),
+                          ('fc2', nn.Linear(hidden_unit, 102, bias=True)), 
+                          ('output', nn.LogSoftmax(dim=1))
+                          ]))
+    elif arch == 'densenet161':
+        in_feature = list(model.children())[0][:-2]
+        model.classifier = nn.Sequential(OrderedDict([
+                          ('fc1', 
+                           nn.Linear(in_feature, 
+                           hidden_unit, 
+                           bias=True)),
+                          ('relu1', nn.ReLU()),
+                          ('dropout1', nn.Dropout(p=0.5)),
+                          ('fc2', nn.Linear(hidden_unit, 102, bias=True)), 
+                          ('output', nn.LogSoftmax(dim=1))
+                          ]))
+    return model
 
-def predict_image(image_path, model, topk=5, gpu="cpu"):
+
+#predict the class from an image file
+def predict_image(args, image_path, model):
     ''' Predict the class (or classes) of an image using a trained deep learning model.
     '''
-    
-    # TODO: Implement the code to predict the class from an image file       
-    if gpu == "cuda":
-        model.cuda()
+       
+    if args.gpu and torch.cuda.is_available():
+        device = args.gpu
     else:
-        model.cpu()
-        
+         device = args.gpu
+    model.to(device)
+
     model.eval()
     
     np_image = process_image(image_path)
@@ -110,19 +105,25 @@ def predict_image(image_path, model, topk=5, gpu="cpu"):
     torch_image = torch_image.unsqueeze(dim = 0)
     
     with torch.no_grad():
-        if gpu == "cuda":
+        if args.gpu == "cuda":
             torch_image = torch_image.cuda()
+            model.to("cuda")
         else:
             torch_image = torch_image.cpu()
+            model.to("cpu")
         
         out = model.forward(torch_image)
         ps = torch.exp(out) 
+       
+        topk = 5
+        if args.topk: 
+            topk = args.topk          
         
-        
-        topk_prob = torch.topk(ps, int(topk))[0].tolist()[0]            # probability
+        topk_prob = torch.topk(ps, topk)[0].tolist()[0]            # probability
         indeces = torch.topk(ps, topk)[1].tolist()[0]              # index
 
         key_value = {val: key for key, val in model.class_to_idx.items()}
+
         topk_classes = [key_value[item] for item in indeces]
         topk_classes = np.array(topk_classes)
     
@@ -139,6 +140,10 @@ def arg_parser():
                         help='Image file to be predicted by network',
                         required=True)
     
+    parser.add_argument('--hidden_unit', 
+                        type=str,  
+                        help='Number of units in hidden layer')
+        
     # Add GPU Option to parser
     parser.add_argument('--gpu', 
                         type=str,  
@@ -158,7 +163,8 @@ def arg_parser():
     # Load checkpoint created by train.py
     parser.add_argument('--checkpoint', 
                         type=str, 
-                        help='Point to checkpoint file as str.')
+                        help='Point to checkpoint file as str.',
+                        required=True)
     
     # Add --arch to parser
     parser.add_argument('--arch', 
@@ -171,42 +177,17 @@ def arg_parser():
 
     
 def main():
-    args = arg_parser()
-    print(args)
+    args = arg_parser()              
     
-    image_path = "flowers/train/1/image_06742.jpg"
-    if args.image:
-        image_path = args.image
-
-    #arch = "vgg16"
-    #if args.arch:
-    #    arch = args.arch
-    #print(arch)
-        
-    #topk = 5
-    #if args.topk:
-    #    topk = args.topk
+    load_categories_to_name()
     
-    #checkpoint = "checkpoint.pth"
-    #if args.checkpoint:
-    #    checkpoint = args.checkpoint
-                
-    #arch = "vgg16"
-    #if args.arch:
-    #    arch = args.arch
-       
-    model = load_pretrained_network(args.arch)
-
-    #if model.arch is "vgg16"
-    if args.checkpoint:
-        model = load_checkpoint(model, args.checkpoint)
-    #else:
-    #    save_checkpoint()
-    topk = 5  
-    if args.topk:
-        topk = args.topk
+    arch = 'vgg16' if args.arch is None else args.arch
+    model = load_checkpoint(arch, args.checkpoint)
+    #print(model)
+      
+    model = feed_forward(model, arch, int(1024 if args.hidden_unit is None else args.hidden_unit))
         
-    probs, classes = predict_image(image_path, model, topk)
+    probs, classes = predict_image(args, args.image, model)
     print(probs)
     print(classes)
 
